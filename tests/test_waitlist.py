@@ -695,14 +695,18 @@ def main() -> int:
     # 长有效期：本用例验证「授权停用」失败路径，排除到期失效干扰。
     w17 = waitlist(c, [m17], region="ISO3", ttl=1440).json()["id"]
     check("候补入队", get_wait(c, w17).json()["status"] == "pending")
+    # 停用与同通道候补共用通道咨询锁：PATCH 停用事务锁内即按既有规则
+    # 重算队首，匹配授权均停用的候补在停用提交后立即为完整 failed 状态，
+    # 不再惰性等到下一次释放；停用授权绝不承接该候补。
     c.patch(f"/api/v1/authorizations/{a17}", json={"status": "inactive"})
-    check("停用后未触发重算仍等待",
-          get_wait(c, w17).json()["status"] == "pending")
-    c.post(f"/api/v1/distributions/{d17}/revoke")  # 撤销触发队列重算
     body = get_wait(c, w17).json()
-    check("重算标记 failed", body["status"] == "failed", body)
+    check("停用后锁内重算立即 failed", body["status"] == "failed", body)
     check("失败原因 authorization_inactive",
           body["failure_reason"] == "authorization_inactive", body)
+    # 随后的撤销只释放既有申请占用，已是终态 failed 的候补不会复活。
+    c.post(f"/api/v1/distributions/{d17}/revoke")  # 释放触发队列重算
+    check("failed 终态不复活",
+          get_wait(c, w17).json()["status"] == "failed")
 
     print("== 23. 有效期字段：受理时记录 ttl/expires_at ==")
     mt = make_material(c, "wl-ttl")

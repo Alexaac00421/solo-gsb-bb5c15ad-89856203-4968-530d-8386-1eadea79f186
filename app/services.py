@@ -9,11 +9,16 @@
     冻结/恢复/预留/申请/候补/转拨行 → 授权行（id 升序）→ 明细行**
 
 通道咨询锁按 ``region+channel`` 分桶：同一通道内的提交、预留、确认、
-取消、撤销、改期、改挂、候补受理与候补成交、额度转拨，以及冻结/恢复
-全部串行判定。授权行只可能被同通道事务竞争（授权匹配维度即
+取消、撤销、改期、改挂、候补受理与候补成交、额度转拨、授权启用/停用，
+以及冻结/恢复全部串行判定。授权行只可能被同通道事务竞争（授权匹配维度即
 region+channel，改挂与转拨也要求两端通道一致），因此不同通道的事务
 不会争用同一授权行，跨桶不可能形成等待环；同事务内对同一批授权一律
 按 id 升序 ``SELECT ... FOR UPDATE``。
+
+授权启用/停用（PATCH 状态）同样先取通道咨询锁、锁内结算到期预留后再
+翻转状态并重算候补，随通道事务一次性提交：因此提交后新写事务只能看到
+变更前或变更后的完整状态，绝不会出现「候补已按启用授权选定、随后才
+停用却仍生成占用」或「转拨从状态变更中间通过」之类的中间态。
 
 通道冻结（region+channel）
 ===========================
@@ -186,11 +191,81 @@ def get_authorization(db: Session, authorization_id: int) -> models.Authorizatio
 def set_authorization_status(
     db: Session, authorization_id: int, status: str
 ) -> models.Authorization:
-    auth = db.get(models.Authorization, authorization_id)
-    if auth is None:
+    """PATCH 启用/停用授权（仅影响新业务，既有申请与预留沿用既有契约）。
+
+    与同 region+channel 的提交、预留、候补受理与成交、撤销、改期、改挂、
+    额度转拨共用同一把通道咨询锁，严格按统一加锁顺序串行；不再直接
+    裸改裸提交，从而杜绝「状态变更与业务事务读到对方中间态」：
+
+    通道锁 →（冻结闸门不拦截状态变更）→ 到期预留惰性结算 →
+    状态翻转 → 候补队列处理 → 提交。
+
+    - 停用：锁内把状态翻成 inactive 后再按既有规则重算本通道候补队首：
+      匹配授权均已停用的队首标记 ``failed``（authorization_inactive），
+      故停用事务提交后新写事务只能看到停用后的完整状态，停用授权不会再
+      承接任何新申请/新预留/新候补，也不会再被改挂承接或额度转拨；
+    - 启用：翻成 active 后同样重算队首，此前仅因该授权停用而无法承接的
+      有效候补可依原受理顺序立即成交；
+    - 通道冻结期间仍允许启用/停用（停用只影响新业务，并非新额度发放），
+      但遵守冻结契约：仅做到期预留与候补有效期结算，**不做候补成交/失败
+      判定**——冻结期间停用授权的失配判定留待恢复事务在同一把锁内完成；
+    - 既有 approved 申请与 pending 预留不受影响：预留确认不重新匹配、不要求
+      启用，仍可确认/取消；授权不存在返回 404（错误码与路径契约不变）。
+    """
+    # 不加锁读取授权（维度不可变），仅用于 404 判定与确定锁桶。
+    head = db.get(models.Authorization, authorization_id)
+    if head is None:
         raise ResourceNotFound("授权", authorization_id)
-    auth.status = status
-    db.commit()
+    region, channel = head.region, head.channel
+
+    try:
+        # 第一加锁点：通道咨询锁，与本通道全部发行类写事务串行。
+        _channel_lock(db, region, channel)
+        now = utcnow()
+        frozen_row = _channel_is_frozen(db, region, channel)
+
+        # 锁内先做本通道到期预留惰性结算（冻结期间同样结算释放，但不触发
+        # 候补成交），同时把目标授权按 id 升序纳入行锁集合，保证随后的
+        # 状态翻转与余量/候补判定基于行锁保护下的最新行值。
+        locked_rows = _settle_expired(
+            db,
+            now,
+            region=region,
+            channel=channel,
+            extra_auth_ids=[authorization_id],
+            frozen=frozen_row is not None,
+        )
+        auth = next(
+            (a for a in locked_rows if a.id == authorization_id), None
+        )
+        if auth is None:
+            # 该授权不涉及任何到期预留时不会出现在结算返回里，显式锁定。
+            auth = db.scalar(
+                select(models.Authorization)
+                .where(models.Authorization.id == authorization_id)
+                .with_for_update()
+            )
+        if auth is None:
+            db.rollback()
+            raise ResourceNotFound("授权", authorization_id)
+
+        # 锁内翻转状态（同态重放同样在锁内串行，幂等空操作）。
+        auth.status = status
+        db.flush()
+
+        # 状态翻转后重算本通道候补队首：停用使失配队首失败、启用可让被
+        # 停用阻塞的有效队首成交；冻结期间仅结算有效期失效，不做
+        # 成交/失败判定（与撤销/取消/改挂等既有写事务完全同契约）。
+        _process_waitlist(
+            db, region, channel, now, allow_fulfill=frozen_row is None
+        )
+        db.commit()
+    except ResourceNotFound:
+        raise
+    except Exception:
+        db.rollback()
+        raise
+
     db.refresh(auth)
     return auth
 
