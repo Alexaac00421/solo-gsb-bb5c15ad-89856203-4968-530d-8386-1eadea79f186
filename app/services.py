@@ -9,8 +9,8 @@
     冻结/恢复/预留/申请/候补/转拨行 → 授权行（id 升序）→ 明细行**
 
 通道咨询锁按 ``region+channel`` 分桶：同一通道内的提交、预留、确认、
-取消、撤销、改期、改挂、候补受理与候补成交、额度转拨，以及冻结/恢复
-全部串行判定。授权行只可能被同通道事务竞争（授权匹配维度即
+取消、撤销、改期、改挂、候补受理与候补成交、额度转拨、授权启用/停用，
+以及冻结/恢复全部串行判定。授权行只可能被同通道事务竞争（授权匹配维度即
 region+channel，改挂与转拨也要求两端通道一致），因此不同通道的事务
 不会争用同一授权行，跨桶不可能形成等待环；同事务内对同一批授权一律
 按 id 升序 ``SELECT ... FOR UPDATE``。
@@ -186,11 +186,33 @@ def get_authorization(db: Session, authorization_id: int) -> models.Authorizatio
 def set_authorization_status(
     db: Session, authorization_id: int, status: str
 ) -> models.Authorization:
+    """启用/停用授权（停用仅影响新申请与新预留的匹配）。
+
+    状态变更与本通道全部发行类写事务（提交/预留/确认/取消/撤销/改期/
+    改挂/候补受理与成交/转拨/冻结恢复）共用同一把通道咨询锁，按统一
+    加锁顺序串行（通道咨询锁 → 授权行锁）：状态翻转在锁内提交后，
+    随后取得该锁的新写事务只能看到变更前或变更后的完整状态——不会
+    出现「候补已按启用授权选定后才停用，仍生成占用」或「转拨在状态
+    变更中间通过」的交错，停用授权因此不会承接任何新业务。既有申请
+    与预留不受影响：确认/撤销/改期/改挂等仍按既有契约处理。
+    """
+    # 不加锁读取通道维度（region/channel 不可变），仅用于确定咨询锁桶。
     auth = db.get(models.Authorization, authorization_id)
     if auth is None:
         raise ResourceNotFound("授权", authorization_id)
-    auth.status = status
-    db.commit()
+    region, channel = auth.region, auth.channel
+    try:
+        # 第一加锁点：通道咨询锁，与同通道全部发行类写事务互斥。
+        _channel_lock(db, region, channel)
+        # 锁内按 id 升序行锁授权并以最新行值刷新（populate_existing），
+        # 状态翻转在锁内提交；事务提交即释放咨询锁，随后进入的新写事务
+        # 只能看到变更前或变更后的完整状态。
+        auth = _lock_authorizations(db, [authorization_id])[0]
+        auth.status = status
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
     db.refresh(auth)
     return auth
 

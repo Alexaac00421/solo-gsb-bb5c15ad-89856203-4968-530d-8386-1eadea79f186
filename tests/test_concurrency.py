@@ -6,6 +6,16 @@
 2. 多素材批量申请（每项引用不同授权）混合并发，验证行锁 + 咨询锁
    不会让任何一个授权超过额度。
 3. 并发撤销与新申请交错，最终 used_count 必须恒等于「未撤销的通过申请数」。
+4. 同一申请并发撤销两次，恰一次成功。
+5. 改挂与撤销并发，归属正确、释放不重复不串号。
+6. 改挂与新申请并发，替代授权绝不超额、账实相符。
+7. 两个并发改挂串行化，次数不重复搬移。
+8. 授权启用/停用（PATCH）与通道写事务共用同一把通道咨询锁：
+   锁被持有时 PATCH 必须阻塞，锁内提交后新事务只能看到变更前/后的完整状态。
+9. 停用与「撤销触发的候补成交」并发：结果必须等价于某一串行顺序，
+   停用提交后候补不得再按已停用授权成交。
+10. 停用与额度转拨并发：转拨不得在状态变更中间通过，
+    结果必须等价于某一串行顺序且两端额度账实相符。
 
 运行：
     DATABASE_URL=postgresql+psycopg://licensing@/licensing?host=/tmp&port=5439 \
@@ -13,10 +23,11 @@
 """
 import os
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 
 os.environ.setdefault(
     "DATABASE_URL",
@@ -28,6 +39,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 from app.database import Base, SessionLocal, engine, init_db  # noqa: E402
 from app.main import app  # noqa: E402
 from app import models  # noqa: E402
+from app.services import _bucket_lock_id  # noqa: E402
 
 CST = timezone(timedelta(hours=8))
 NOW = datetime(2026, 11, 1, 12, 0, tzinfo=CST)
@@ -667,6 +679,368 @@ def scenario_double_migrate_race() -> None:
     )
 
 
+def scenario_patch_shares_channel_lock() -> None:
+    print("== 场景8：授权启用/停用与通道写事务共用同一把通道咨询锁 ==")
+    client = TestClient(app)
+    mid = client.post(
+        "/api/v1/materials", json={"code": "c8", "name": "状态变更锁"}
+    ).json()["id"]
+    aid = client.post(
+        "/api/v1/authorizations",
+        json={
+            "material_id": mid,
+            "region": "CN",
+            "channel": "patchlock",
+            "starts_at": (NOW - timedelta(days=1)).isoformat(),
+            "ends_at": (NOW + timedelta(days=1)).isoformat(),
+            "max_count": 3,
+        },
+    ).json()["id"]
+    lock_id = _bucket_lock_id("CN", "patchlock")
+
+    def patch(status: str):
+        c = TestClient(app)
+        return c.patch(
+            f"/api/v1/authorizations/{aid}", json={"status": status}
+        )
+
+    # 8a) 另一事务持有通道咨询锁期间，PATCH 必须阻塞（不得绕过锁直接提交）；
+    #     阻塞期间外部读到的仍是变更前的完整状态；锁释放后 PATCH 才提交。
+    holder = SessionLocal()
+    holder.execute(
+        text("SELECT pg_advisory_xact_lock(:lk)"), {"lk": lock_id}
+    )
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        fut = pool.submit(patch, "inactive")
+        time.sleep(1.5)
+        assert not fut.done(), "通道咨询锁被持有时 PATCH 必须等待，不得直接提交"
+        probe = SessionLocal()
+        try:
+            observed = probe.execute(
+                select(models.Authorization.status).where(
+                    models.Authorization.id == aid
+                )
+            ).scalar_one()
+        finally:
+            probe.close()
+        assert observed == "active", (
+            f"PATCH 阻塞期间外部不得看到中间态，实际 {observed}"
+        )
+        holder.rollback()  # 释放通道咨询锁
+        r = fut.result(timeout=15)
+    holder.close()
+    assert r.status_code == 200 and r.json()["status"] == "inactive", r.text
+    assert (
+        client.get(f"/api/v1/authorizations/{aid}").json()["status"]
+        == "inactive"
+    )
+    print("  PASS  8a 通道锁持有期间 PATCH 阻塞，释放后提交为 inactive")
+
+    # 8b) PATCH 与新发行申请在同一把通道锁后排队：二者都被阻塞，锁释放后
+    #     按某一串行顺序完成——申请要么看到启用后的完整状态（201），
+    #     要么看到启用前的完整状态（422 authorization_inactive）。
+    holder = SessionLocal()
+    holder.execute(
+        text("SELECT pg_advisory_xact_lock(:lk)"), {"lk": lock_id}
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f_patch = pool.submit(patch, "active")
+        f_dist = pool.submit(
+            lambda: TestClient(app).post(
+                "/api/v1/distributions",
+                json={
+                    "material_ids": [mid],
+                    "region": "CN",
+                    "channel": "patchlock",
+                    "occur_at": NOW.isoformat(),
+                },
+            )
+        )
+        time.sleep(1.5)
+        assert not f_patch.done() and not f_dist.done(), (
+            "PATCH 与新申请都应在通道锁后排队"
+        )
+        holder.rollback()
+        rp = f_patch.result(timeout=15)
+        rd = f_dist.result(timeout=15)
+    holder.close()
+    assert rp.status_code == 200 and rp.json()["status"] == "active", rp.text
+    used = client.get(f"/api/v1/authorizations/{aid}").json()["used_count"]
+    if rd.status_code == 201:
+        # 串行顺序：启用先提交，新申请看到启用后的完整状态。
+        assert used == 1, f"申请成功后 used_count 应为 1，实际 {used}"
+    else:
+        # 串行顺序：新申请先进入，看到的仍是停用状态。
+        assert rd.status_code == 422, rd.text
+        assert (
+            rd.json()["error"]["details"][0]["reason"]
+            == "authorization_inactive"
+        ), rd.text
+        assert used == 0, f"申请被拒绝不得占额，实际 used_count={used}"
+    print(
+        f"  PASS  8b PATCH 与新申请同锁排队，申请结果={rd.status_code}"
+        "（等价于某一串行顺序）"
+    )
+
+
+def scenario_disable_vs_waitlist_fulfill() -> None:
+    print("== 场景9：停用与撤销触发的候补成交并发，结果等价于某一串行顺序 ==")
+    client = TestClient(app)
+    mid = client.post(
+        "/api/v1/materials", json={"code": "c9", "name": "停用候补竞态"}
+    ).json()["id"]
+
+    fulfilled = failed = 0
+    for round_no in range(10):
+        channel = f"wl{round_no}"
+        aid = client.post(
+            "/api/v1/authorizations",
+            json={
+                "material_id": mid,
+                "region": "CN",
+                "channel": channel,
+                "starts_at": (NOW - timedelta(days=1)).isoformat(),
+                "ends_at": (NOW + timedelta(days=1)).isoformat(),
+                "max_count": 1,
+            },
+        ).json()["id"]
+        # 占满唯一额度，随后候补入队。
+        rd = client.post(
+            "/api/v1/distributions",
+            json={
+                "material_ids": [mid],
+                "region": "CN",
+                "channel": channel,
+                "occur_at": NOW.isoformat(),
+            },
+        )
+        assert rd.status_code == 201, rd.text
+        did = rd.json()["id"]
+        rw = client.post(
+            "/api/v1/waitlists",
+            json={
+                "material_ids": [mid],
+                "region": "CN",
+                "channel": channel,
+                "occur_at": NOW.isoformat(),
+                "ttl_minutes": 60,
+            },
+        )
+        assert rw.status_code == 201 and rw.json()["status"] == "pending", rw.text
+        wid = rw.json()["id"]
+
+        # 并发：停用授权 vs 撤销申请（撤销释放额度会触发候补成交判定）。
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            f_patch = pool.submit(
+                lambda: TestClient(app).patch(
+                    f"/api/v1/authorizations/{aid}",
+                    json={"status": "inactive"},
+                )
+            )
+            f_revoke = pool.submit(
+                lambda: TestClient(app).post(
+                    f"/api/v1/distributions/{did}/revoke"
+                )
+            )
+            rp = f_patch.result()
+            rr = f_revoke.result()
+        assert rp.status_code == 200 and rp.json()["status"] == "inactive"
+        assert rr.status_code == 200, rr.text
+
+        w = client.get(f"/api/v1/waitlists/{wid}").json()
+        auth = client.get(f"/api/v1/authorizations/{aid}").json()
+        if w["status"] == "fulfilled":
+            # 串行顺序：撤销先成交（授权当时仍启用），停用随后生效；
+            # 成交占用完整保留，停用不影响已通过的申请。
+            fulfilled += 1
+            assert auth["used_count"] == 1, auth
+            d = client.get(f"/api/v1/distributions/{w['distribution_id']}").json()
+            assert d["status"] == "approved"
+        else:
+            # 串行顺序：停用先生效，撤销释放时授权已不再匹配，
+            # 候补标记 failed，绝不按已停用授权生成占用。
+            assert w["status"] == "failed", w
+            assert w["failure_reason"] == "authorization_inactive", w
+            failed += 1
+            assert auth["used_count"] == 0, auth
+        assert auth["status"] == "inactive"
+    print(
+        f"  PASS  10 轮：成交后停用={fulfilled} 次、停用后失配={failed} 次，"
+        "均等价于某一串行顺序，无「停用后仍生成占用」"
+    )
+
+
+def scenario_disable_vs_transfer() -> None:
+    print("== 场景10：停用与额度转拨并发，转拨不得在状态变更中间通过 ==")
+    client = TestClient(app)
+    mid = client.post(
+        "/api/v1/materials", json={"code": "c10", "name": "停用转拨竞态"}
+    ).json()["id"]
+
+    moved = blocked = 0
+    for round_no in range(10):
+        channel = f"tr{round_no}"
+        common = {
+            "material_id": mid,
+            "region": "CN",
+            "channel": channel,
+            "starts_at": (NOW - timedelta(days=1)).isoformat(),
+            "ends_at": (NOW + timedelta(days=1)).isoformat(),
+        }
+        src = client.post(
+            "/api/v1/authorizations", json={**common, "max_count": 10}
+        ).json()["id"]
+        tgt = client.post(
+            "/api/v1/authorizations", json={**common, "max_count": 5}
+        ).json()["id"]
+        op_no = f"OP-PATCH-TR-{round_no}"
+        payload = {
+            "source_authorization_id": src,
+            "target_authorization_id": tgt,
+            "count": 3,
+            "operation_no": op_no,
+        }
+
+        def delayed_patch():
+            # 奇数轮稍作延迟，让转拨先取得通道锁，覆盖两种串行顺序。
+            if round_no % 2 == 1:
+                time.sleep(0.3)
+            return TestClient(app).patch(
+                f"/api/v1/authorizations/{src}", json={"status": "inactive"}
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            f_patch = pool.submit(delayed_patch)
+            f_tr = pool.submit(
+                lambda: TestClient(app).post(
+                    "/api/v1/authorizations/transfer", json=payload
+                )
+            )
+            rp = f_patch.result()
+            rt = f_tr.result()
+
+        assert rp.status_code == 200 and rp.json()["status"] == "inactive"
+        s = client.get(f"/api/v1/authorizations/{src}").json()
+        t = client.get(f"/api/v1/authorizations/{tgt}").json()
+        if rt.status_code == 200:
+            # 串行顺序：转拨先完成（两端当时均启用），停用随后生效。
+            moved += 1
+            assert (s["max_count"], t["max_count"]) == (7, 8), (s, t)
+            # 幂等重放不受随后的停用影响：同号同参返回首次结果。
+            replay = client.post(
+                "/api/v1/authorizations/transfer", json=payload
+            )
+            assert replay.status_code == 200, replay.text
+            assert replay.json() == rt.json(), (replay.json(), rt.json())
+        else:
+            # 串行顺序：停用先生效，转拨在锁内读到完整新状态而整笔拒绝，
+            # 两端额度均不变。
+            assert rt.status_code == 422, rt.text
+            err = rt.json()["error"]
+            assert err["code"] == "quota_transfer_rejected", rt.text
+            assert (
+                err["details"][0]["reason"] == "authorization_inactive"
+            ), rt.text
+            assert (s["max_count"], t["max_count"]) == (10, 5), (s, t)
+            blocked += 1
+        # 账实相符：转拨只动 max_count，两端占用/预留不变，不变量保持。
+        assert s["used_count"] == 0 and t["used_count"] == 0
+        assert s["reserved_count"] == 0 and t["reserved_count"] == 0
+        assert s["status"] == "inactive" and t["status"] == "active"
+    assert moved > 0 and blocked > 0, (
+        f"两种串行顺序都应被覆盖：moved={moved} blocked={blocked}"
+    )
+    print(
+        f"  PASS  10 轮：转拨先于停用={moved} 次、停用先于转拨={blocked} 次，"
+        "无中间态、额度账实相符"
+    )
+
+
+def scenario_disable_vs_migrate() -> None:
+    print("== 场景11：启用/停用与改挂并发，状态翻转与次数搬移不交错 ==")
+    client = TestClient(app)
+    mid = client.post(
+        "/api/v1/materials", json={"code": "c11", "name": "状态改挂竞态"}
+    ).json()["id"]
+
+    for round_no in range(6):
+        channel = f"mg{round_no}"
+        common = {
+            "material_id": mid,
+            "region": "CN",
+            "channel": channel,
+            "starts_at": (NOW - timedelta(days=2)).isoformat(),
+            "ends_at": (NOW + timedelta(days=2)).isoformat(),
+        }
+        src = client.post(
+            "/api/v1/authorizations", json={**common, "max_count": 5}
+        ).json()["id"]
+        tgt = client.post(
+            "/api/v1/authorizations", json={**common, "max_count": 50}
+        ).json()["id"]
+        for _ in range(2):
+            r = client.post(
+                "/api/v1/distributions",
+                json={
+                    "material_ids": [mid],
+                    "region": "CN",
+                    "channel": channel,
+                    "occur_at": NOW.isoformat(),
+                },
+            )
+            assert r.status_code == 201, r.text
+
+        # 并发：PATCH 翻转源授权状态（启用）vs 改挂（成功会把源置为停用）。
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            f_patch = pool.submit(
+                lambda: TestClient(app).patch(
+                    f"/api/v1/authorizations/{src}", json={"status": "active"}
+                )
+            )
+            f_mg = pool.submit(
+                lambda: TestClient(app).post(
+                    "/api/v1/authorizations/migrate",
+                    json={
+                        "source_authorization_id": src,
+                        "replacement_authorization_id": tgt,
+                    },
+                )
+            )
+            rp = f_patch.result()
+            rm = f_mg.result()
+
+        assert rp.status_code == 200, rp.text
+        assert rm.status_code == 200, rm.text
+        assert rm.json()["migrated_count"] == 2, rm.text
+        s = client.get(f"/api/v1/authorizations/{src}").json()
+        t = client.get(f"/api/v1/authorizations/{tgt}").json()
+        # 次数搬移完整：源迁出归零、目标承接 2 条，绝不部分搬移。
+        assert s["used_count"] == 0 and t["used_count"] == 2, (s, t)
+        # 最终状态恰为某一串行顺序的结果：改挂后启用（active）
+        # 或启用后改挂（inactive），不得出现中间态。
+        assert s["status"] in ("active", "inactive"), s
+        # 账实相符：目标 used_count 等于归属它的有效明细数。
+        db = SessionLocal()
+        try:
+            valid = db.scalar(
+                select(func.count())
+                .select_from(models.DistributionItem)
+                .join(
+                    models.Distribution,
+                    models.DistributionItem.distribution_id
+                    == models.Distribution.id,
+                )
+                .where(
+                    models.DistributionItem.authorization_id == tgt,
+                    models.Distribution.status == "approved",
+                )
+            )
+        finally:
+            db.close()
+        assert t["used_count"] == valid, (t["used_count"], valid)
+    print("  PASS  6 轮：状态翻转与改挂串行，次数完整搬移、账实相符")
+
+
 def main() -> int:
     Base.metadata.drop_all(bind=engine)
     init_db()
@@ -678,6 +1052,10 @@ def main() -> int:
         scenario_migrate_vs_revoke()
         scenario_migrate_vs_submit()
         scenario_double_migrate_race()
+        scenario_patch_shares_channel_lock()
+        scenario_disable_vs_waitlist_fulfill()
+        scenario_disable_vs_transfer()
+        scenario_disable_vs_migrate()
     print("\n全部并发场景通过：未发生超额、账实相符。")
     return 0
 
