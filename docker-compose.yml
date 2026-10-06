@@ -1,0 +1,37 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-licensing}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-licensing}
+      POSTGRES_DB: ${POSTGRES_DB:-licensing}
+    ports:
+      - "${DB_HOST_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-licensing} -d ${POSTGRES_DB:-licensing}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  api:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-licensing}:${POSTGRES_PASSWORD:-licensing}@db:5432/${POSTGRES_DB:-licensing}
+      DB_WAIT_TIMEOUT: "30"
+      DB_POOL_SIZE: "10"
+      DB_MAX_OVERFLOW: "20"
+      # 预留有效期允许范围（分钟）；代码侧固定 1～30，可在此区间内收窄
+      RESERVATION_TTL_MIN_MINUTES: "${RESERVATION_TTL_MIN_MINUTES:-1}"
+      RESERVATION_TTL_MAX_MINUTES: "${RESERVATION_TTL_MAX_MINUTES:-30}"
+    ports:
+      - "${API_HOST_PORT:-8000}:8000"
+    restart: unless-stopped
+
+volumes:
+  pgdata:
